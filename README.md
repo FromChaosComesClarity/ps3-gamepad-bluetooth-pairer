@@ -60,7 +60,16 @@ ps3pair forget <address>       remove a controller from BlueZ
 ps3pair --events <command>     JSON-lines progress output (used by the GUI)
 ```
 
+## Tested with
+
+- SHANWAN PS3 GamePad clone (USB `054c:0268`, reports itself over Bluetooth as
+  `PLAYSTATION(R)3Conteroller-PANHAI`) on Omarchy with BlueZ 5.87. This clone needs the clone fix.
+
 ## Troubleshooting
+
+- **Controller vanished from USB, and other devices on the same ports did too**: check
+  `journalctl -k | grep "HC died"`. If the USB host controller crashed, reboot, or reset it:
+  `echo <pci-id> | sudo tee /sys/bus/pci/drivers/xhci_hcd/unbind` and then the same with `bind`.
 
 - **No controller found**: try another cable. Many cables are charge-only.
 - **"BlueZ never registered the controller"**: run `journalctl -u bluetooth | grep sixaxis`. The
