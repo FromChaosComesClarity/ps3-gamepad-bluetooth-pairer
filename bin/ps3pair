@@ -25,7 +25,7 @@ import subprocess
 import sys
 import time
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 
 SONY_VID = 0x054C
 PS3_PIDS = {0x0268: "PLAYSTATION(R)3 Controller", 0x042F: "PS Move Navigation"}
