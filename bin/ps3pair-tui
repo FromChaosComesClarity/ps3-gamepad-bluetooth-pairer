@@ -1,0 +1,110 @@
+#!/bin/bash
+# ps3pair-tui - gum front-end for ps3pair, styled like Omarchy's own TUIs.
+
+set -uo pipefail
+
+PS3PAIR=${PS3PAIR:-$(dirname "$(readlink -f "$0")")/ps3pair}
+[[ -x $PS3PAIR ]] || PS3PAIR=ps3pair
+
+for dep in gum jq; do
+  command -v "$dep" >/dev/null || { echo "ps3pair-tui needs '$dep' (omarchy pkg add $dep)"; exit 1; }
+done
+
+ACCENT=4
+COLORS_TOML="$HOME/.config/omarchy/current/theme/colors.toml"
+[[ -f $COLORS_TOML ]] || COLORS_TOML="$HOME/.local/state/omarchy/current/theme/colors.toml"
+if [[ -f $COLORS_TOML ]]; then
+  ACCENT=$(sed -nE 's/^accent *= *"(#[0-9A-Fa-f]{6})".*/\1/p' "$COLORS_TOML" | head -1)
+  ACCENT=${ACCENT:-4}
+fi
+export GUM_CHOOSE_CURSOR_FOREGROUND=$ACCENT GUM_CHOOSE_HEADER_FOREGROUND=$ACCENT
+export GUM_CONFIRM_SELECTED_BACKGROUND=$ACCENT
+
+header() {
+  clear
+  gum style --border rounded --border-foreground "$ACCENT" --padding "0 2" --margin "1 0 0 1" \
+    --foreground "$ACCENT" --bold "  PS3 Gamepad Bluetooth Pairer"
+  echo
+}
+
+pause() {
+  echo
+  gum style --faint "  Press any key to continue"
+  read -rsn1
+}
+
+status_json() { "$PS3PAIR" status --json 2>/dev/null; }
+
+offer_clone_fix() {
+  local st=$1
+  local clone bonded_only
+  clone=$(jq -r '[.controllers[] | select(.clone)] | length' <<<"$st")
+  bonded_only=$(jq -r '.classic_bonded_only' <<<"$st")
+  if ((clone > 0)) && [[ $bonded_only == true ]]; then
+    gum style --foreground 3 --margin "0 2" \
+      "This is a clone controller. BlueZ rejects clones unless ClassicBondedOnly=false" \
+      "is set in /etc/bluetooth/input.conf (needs your password, restarts Bluetooth)."
+    echo
+    if gum confirm "  Apply the clone fix first?"; then
+      "$PS3PAIR" fix-clone
+      echo
+    fi
+  fi
+}
+
+do_pair() {
+  local st count
+  st=$(status_json)
+  count=$(jq '.controllers | length' <<<"$st")
+  if ((count == 0)); then
+    gum style --foreground 1 --margin "0 2" "No PS3 controller on USB." \
+      "Plug it in with a USB data cable, then pick Pair again."
+    pause
+    return
+  fi
+
+  local device
+  device=$(jq -r '.controllers[0].hidraw' <<<"$st")
+  if ((count > 1)); then
+    device=$(jq -r '.controllers[] | "\(.hidraw)  \(.name)  \(.address)"' <<<"$st" |
+      gum choose --header "  Which controller?" | awk '{print $1}')
+    [[ -n $device ]] || return
+  fi
+
+  offer_clone_fix "$st"
+  "$PS3PAIR" pair --device "$device"
+  pause
+}
+
+do_forget() {
+  local st choice
+  st=$(status_json)
+  choice=$(jq -r '([.controllers[] | select(.bluez) | {address, name}] + [.known[] | {address, name}])
+      | unique_by(.address)[] | "\(.address)  \(.name)"' <<<"$st" |
+    gum choose --header "  Forget which controller?")
+  [[ -n $choice ]] || return
+  "$PS3PAIR" forget "${choice%% *}"
+  pause
+}
+
+while true; do
+  header
+  "$PS3PAIR" status | sed 's/^/ /'
+  echo
+  action=$(gum choose --header "  What do you want to do?" \
+    "Pair controller" \
+    "Apply clone fix (ClassicBondedOnly=false)" \
+    "Turn Bluetooth on" \
+    "Forget a controller" \
+    "Refresh" \
+    "Quit") || exit 0
+
+  case $action in
+    "Pair controller") header; do_pair ;;
+    "Apply clone fix"*) header; "$PS3PAIR" fix-clone; pause ;;
+    "Turn Bluetooth on") "$PS3PAIR" prepare; pause ;;
+    "Forget a controller") do_forget ;;
+    "Refresh") ;;
+    *) exit 0 ;;
+  esac
+done

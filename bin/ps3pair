@@ -1,0 +1,685 @@
+#!/usr/bin/env python3
+"""ps3pair - pair a PlayStation 3 controller (DualShock 3 / Sixaxis and clones)
+with this machine over Bluetooth.
+
+A PS3 controller has no Bluetooth "pairing mode". Instead, while it is plugged in
+over USB, the host writes its own Bluetooth address into the controller (HID
+feature report 0xF5). From then on, pressing the PS button makes the controller
+connect to that host. BlueZ also has to know the controller and trust it, which
+its sixaxis plugin does when the controller is plugged in while an agent
+authorizes it.
+
+This tool does all of that, and works the same from a terminal, the gum TUI
+(ps3pair-tui) and the Quickshell GUI (which reads `--json` / `--events` output).
+Nothing is machine-specific: the adapter and controller are detected at runtime.
+"""
+
+import argparse
+import fcntl
+import glob
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+VERSION = "1.0.0"
+
+SONY_VID = 0x054C
+PS3_PIDS = {0x0268: "PLAYSTATION(R)3 Controller", 0x042F: "PS Move Navigation"}
+INPUT_CONF = "/etc/bluetooth/input.conf"
+
+BLUEZ = "org.bluez"
+AGENT_PATH = "/org/ps3pair/agent"
+
+EVENTS = False  # set by --events: emit JSON lines instead of human text
+
+
+# --------------------------------------------------------------------------- #
+# Output
+# --------------------------------------------------------------------------- #
+
+COLORS = {"info": "34", "ok": "32", "warn": "33", "error": "31", "step": "36;1", "action": "35;1"}
+MARKS = {"step": "==>", "info": "  ·", "ok": "  ✓", "warn": "  !", "error": "  ✗", "action": "  ▶", "done": "  ✓"}
+
+
+def emit(kind, message, **fields):
+    """Report progress. kind: step | info | ok | warn | error | action | done."""
+    if EVENTS:
+        print(json.dumps({"event": kind, "message": message, **fields}), flush=True)
+        return
+    mark = MARKS.get(kind, "  ·")
+    color = COLORS.get("ok" if kind == "done" else kind)
+    if sys.stdout.isatty() and color:
+        print(f"\033[{color}m{mark}\033[0m {message}", flush=True)
+    else:
+        print(f"{mark} {message}", flush=True)
+
+
+def die(message, code=1, **fields):
+    emit("error", message, **fields)
+    sys.exit(code)
+
+
+# --------------------------------------------------------------------------- #
+# hidraw access
+# --------------------------------------------------------------------------- #
+
+def _ioc(direction, nr, size):
+    return (direction << 30) | (size << 16) | (ord("H") << 8) | nr
+
+
+def HIDIOCGFEATURE(size):
+    return _ioc(3, 0x07, size)
+
+
+def HIDIOCSFEATURE(size):
+    return _ioc(3, 0x06, size)
+
+
+ADDR_RE = r"(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}"
+
+
+def fmt_addr(raw):
+    return ":".join(f"{b:02X}" for b in raw)
+
+
+def parse_addr(text):
+    if not re.fullmatch(ADDR_RE, text or ""):
+        raise ValueError(f"not a Bluetooth address: {text!r}")
+    return bytes(int(x, 16) for x in text.split(":"))
+
+
+def get_feature(fd, report_id, size):
+    buf = bytearray(size)
+    buf[0] = report_id
+    fcntl.ioctl(fd, HIDIOCGFEATURE(size), buf)
+    return bytes(buf)
+
+
+def read_device_address(fd):
+    # Report 0xF2: the controller's own address starts at offset 4.
+    return fmt_addr(get_feature(fd, 0xF2, 18)[4:10])
+
+
+def read_master_address(fd):
+    # Report 0xF5: the host it will connect to sits at offset 2.
+    return fmt_addr(get_feature(fd, 0xF5, 8)[2:8])
+
+
+def write_master_address(fd, address):
+    buf = bytearray(8)
+    buf[0] = 0xF5
+    buf[1] = 0x01
+    buf[2:8] = parse_addr(address)
+    fcntl.ioctl(fd, HIDIOCSFEATURE(len(buf)), buf)
+
+
+def _uevent(path):
+    data = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                k, _, v = line.strip().partition("=")
+                data[k] = v
+    except OSError:
+        pass
+    return data
+
+
+def find_controllers():
+    """PS3 controllers attached over USB (HID bus 0003)."""
+    found = []
+    for node in sorted(glob.glob("/sys/class/hidraw/hidraw*")):
+        ev = _uevent(os.path.join(node, "device", "uevent"))
+        m = re.fullmatch(r"([0-9A-Fa-f]{4}):([0-9A-Fa-f]{8}):([0-9A-Fa-f]{8})", ev.get("HID_ID", ""))
+        if not m:
+            continue
+        bus, vid, pid = (int(x, 16) for x in m.groups())
+        if bus != 0x03 or vid != SONY_VID or pid not in PS3_PIDS:
+            continue
+        name = ev.get("HID_NAME") or PS3_PIDS[pid]
+        dev = "/dev/" + os.path.basename(node)
+        info = {
+            "hidraw": dev,
+            "name": name,
+            # Genuine pads report "Sony PLAYSTATION(R)3 Controller"; clones (SHANWAN,
+            # Gasia, ...) reuse Sony's IDs with their own name.
+            "clone": "sony" not in name.lower() and "playstation" not in name.lower(),
+            "address": None,
+            "master": None,
+            "error": None,
+        }
+        try:
+            fd = os.open(dev, os.O_RDWR)
+            try:
+                info["address"] = read_device_address(fd)
+                info["master"] = read_master_address(fd)
+            finally:
+                os.close(fd)
+        except OSError as e:
+            info["error"] = f"cannot access {dev}: {e.strerror}"
+            uniq = ev.get("HID_UNIQ", "")
+            if re.fullmatch(ADDR_RE, uniq):
+                info["address"] = uniq.upper()
+        found.append(info)
+    return found
+
+
+def pick_controller(device):
+    controllers = find_controllers()
+    if device:
+        controllers = [c for c in controllers
+                       if c["hidraw"] == device or (c["address"] or "") == device.upper()]
+    if not controllers:
+        die("No PS3 controller found on USB. Plug it in with a USB data cable (not charge-only).")
+    return controllers[0]
+
+
+# --------------------------------------------------------------------------- #
+# Adapter / BlueZ state
+# --------------------------------------------------------------------------- #
+
+def run(cmd, timeout=10):
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return 1, ""
+
+
+def bluetooth_blocked():
+    """'hard', 'soft', '' (not blocked) or None (unknown)."""
+    rc, out = run(["rfkill", "--json", "--output", "TYPE,SOFT,HARD"])
+    if rc != 0:
+        return None
+    try:
+        devs = next(iter(json.loads(out).values()), [])
+    except (ValueError, AttributeError):
+        return None
+    bt = [d for d in devs if d.get("type") == "bluetooth"]
+    if not bt:
+        return None
+    if any(d.get("hard") == "blocked" for d in bt):
+        return "hard"
+    if any(d.get("soft") == "blocked" for d in bt):
+        return "soft"
+    return ""
+
+
+def adapter_info():
+    """Default adapter address and power state, via bluetoothctl."""
+    rc, out = run(["bluetoothctl", "show"], timeout=5)
+    m = re.search(r"Controller (" + ADDR_RE + ")", out)
+    if rc != 0 or not m:
+        return None
+    name = re.search(r"\n\s*Alias: (.*)", out)
+    return {
+        "address": m.group(1).upper(),
+        "name": name.group(1).strip() if name else None,
+        "powered": "Powered: yes" in out,
+    }
+
+
+def bluez_device(address):
+    if not address:
+        return None
+    rc, out = run(["bluetoothctl", "info", address], timeout=5)
+    if rc != 0 or "Device " not in out:
+        return None
+
+    def flag(key):
+        return f"{key}: yes" in out
+
+    name = re.search(r"\n\s*Name: (.*)", out)
+    return {
+        "name": name.group(1).strip() if name else None,
+        "paired": flag("Paired"),
+        "bonded": flag("Bonded"),
+        "trusted": flag("Trusted"),
+        "connected": flag("Connected"),
+        "blocked": flag("Blocked"),
+    }
+
+
+def classic_bonded_only():
+    """Effective ClassicBondedOnly from input.conf (BlueZ default: true)."""
+    value = True
+    try:
+        with open(INPUT_CONF) as f:
+            for line in f:
+                m = re.match(r"\s*ClassicBondedOnly\s*=\s*(\S+)", line)
+                if m:
+                    value = m.group(1).lower() not in ("false", "no", "0", "off")
+    except OSError:
+        pass
+    return value
+
+
+def known_bluetooth_controllers():
+    """PS3 controllers BlueZ already knows (paired earlier, maybe connected now)."""
+    rc, out = run(["bluetoothctl", "devices"], timeout=5)
+    result = []
+    for line in out.splitlines():
+        m = re.match(r"Device (" + ADDR_RE + r") (.*)", line.strip())
+        if not m:
+            continue
+        address, name = m.group(1).upper(), m.group(2)
+        if re.search(r"PLAYSTATION|PS3|SHANWAN|Sixaxis|Gasia", name, re.I):
+            info = bluez_device(address) or {}
+            info.update({"address": address, "name": name})
+            result.append(info)
+    return result
+
+
+def collect_status():
+    adapter = adapter_info()
+    controllers = find_controllers()
+    for c in controllers:
+        c["bluez"] = bluez_device(c["address"])
+        c["paired_here"] = bool(adapter and c["master"] and adapter["address"] == c["master"])
+    return {
+        "version": VERSION,
+        "rfkill": bluetooth_blocked(),
+        "adapter": adapter,
+        "classic_bonded_only": classic_bonded_only(),
+        "input_conf": INPUT_CONF,
+        "controllers": controllers,
+        "known": known_bluetooth_controllers(),
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Commands
+# --------------------------------------------------------------------------- #
+
+def cmd_status(args):
+    st = collect_status()
+    if args.json:
+        print(json.dumps(st, indent=2))
+        return
+
+    a = st["adapter"]
+    if st["rfkill"] == "hard":
+        emit("error", "Bluetooth is hardware-blocked (check the airplane/radio switch)")
+    elif st["rfkill"] == "soft":
+        emit("warn", "Bluetooth is turned off — run: ps3pair prepare")
+    if not a:
+        emit("error", "No Bluetooth adapter found")
+    else:
+        emit("ok" if a["powered"] else "warn",
+             f"Adapter {a['name']} {a['address']} — power {'on' if a['powered'] else 'off'}")
+    if st["classic_bonded_only"]:
+        emit("info", f"ClassicBondedOnly=true in {INPUT_CONF} (clone controllers usually need false)")
+    else:
+        emit("ok", f"ClassicBondedOnly=false in {INPUT_CONF}")
+
+    if not st["controllers"]:
+        emit("warn", "No PS3 controller on USB")
+    for c in st["controllers"]:
+        emit("step", f"{c['name']} ({'clone' if c['clone'] else 'genuine'}) on {c['hidraw']}")
+        emit("info", f"controller address: {c['address'] or 'unknown'}")
+        if c["error"]:
+            emit("error", c["error"])
+        else:
+            emit("ok" if c["paired_here"] else "info",
+                 f"host address:       {c['master']}{' (this machine)' if c['paired_here'] else ''}")
+        b = c["bluez"]
+        if b:
+            emit("ok" if b["trusted"] else "info",
+                 f"BlueZ: trusted={b['trusted']} connected={b['connected']}")
+        else:
+            emit("info", "BlueZ: not registered yet")
+
+    usb = {c["address"] for c in st["controllers"]}
+    for k in st["known"]:
+        if k["address"] in usb:
+            continue
+        emit("ok" if k.get("connected") else "info",
+             f"Known over Bluetooth: {k['name']} {k['address']} "
+             f"({'connected' if k.get('connected') else 'not connected'})")
+
+
+def ensure_powered():
+    blocked = bluetooth_blocked()
+    if blocked == "hard":
+        die("Bluetooth is hardware-blocked (check the airplane/radio switch)")
+    a = adapter_info()
+    if a and a["powered"] and not blocked:
+        emit("ok", f"Bluetooth is on ({a['name']} {a['address']})")
+        return a
+
+    emit("info", "Turning Bluetooth on")
+    if shutil.which("omarchy-bluetooth-power"):
+        run(["omarchy-bluetooth-power", "on"], timeout=15)
+    else:
+        run(["rfkill", "unblock", "bluetooth"])
+        time.sleep(1)
+        run(["bluetoothctl", "power", "on"])
+
+    for _ in range(20):
+        a = adapter_info()
+        if a and a["powered"]:
+            emit("ok", f"Bluetooth is on ({a['name']} {a['address']})")
+            return a
+        time.sleep(0.25)
+    die("Could not power on the Bluetooth adapter (is bluetooth.service running?)")
+
+
+def cmd_prepare(args):
+    ensure_powered()
+
+
+def privileged(script, use_pkexec):
+    """Run a shell snippet as root: sudo in a terminal, pkexec otherwise."""
+    tool = "pkexec" if use_pkexec or not sys.stdin.isatty() else "sudo"
+    return subprocess.run([tool, "sh", "-c", script]).returncode
+
+
+def cmd_fix_clone(args):
+    if not classic_bonded_only():
+        emit("ok", f"ClassicBondedOnly is already false in {INPUT_CONF}")
+        return
+    emit("step", f"Setting ClassicBondedOnly=false in {INPUT_CONF}")
+    emit("info", "Clone controllers (SHANWAN, Gasia, ...) connect without bonding, which BlueZ rejects by default")
+    script = f"""set -e
+conf={INPUT_CONF}
+[ -f "$conf" ] || printf '[General]\\n' > "$conf"
+cp -a "$conf" "$conf.ps3pair.bak"
+if grep -qE '^[#[:space:]]*ClassicBondedOnly[[:space:]]*=' "$conf"; then
+  sed -i -E 's/^[#[:space:]]*ClassicBondedOnly[[:space:]]*=.*/ClassicBondedOnly=false/' "$conf"
+elif grep -q '^\\[General\\]' "$conf"; then
+  sed -i '/^\\[General\\]/a ClassicBondedOnly=false' "$conf"
+else
+  printf '\\n[General]\\nClassicBondedOnly=false\\n' >> "$conf"
+fi
+systemctl restart bluetooth
+"""
+    if privileged(script, args.pkexec) != 0:
+        die("Could not update input.conf (authentication cancelled or failed)")
+    if classic_bonded_only():
+        die("input.conf still has ClassicBondedOnly enabled")
+    emit("ok", f"ClassicBondedOnly=false set (backup: {INPUT_CONF}.ps3pair.bak); bluetooth restarted")
+    for _ in range(20):
+        if adapter_info():
+            break
+        time.sleep(0.25)
+    ensure_powered()
+
+
+def set_master(c, target):
+    try:
+        fd = os.open(c["hidraw"], os.O_RDWR)
+    except OSError as e:
+        die(f"Cannot open {c['hidraw']}: {e.strerror}. Re-plug the controller, or run once with sudo.")
+    try:
+        before = read_master_address(fd)
+        if before == target:
+            emit("ok", f"Controller already points at this machine ({target})")
+            return
+        write_master_address(fd, target)
+        after = read_master_address(fd)
+    finally:
+        os.close(fd)
+    if after != target:
+        die(f"Controller kept host {after} instead of {target}")
+    emit("ok", f"Controller host address set: {before} → {target}")
+
+
+def cmd_set_master(args):
+    c = pick_controller(args.device)
+    target = (args.address or (adapter_info() or {}).get("address") or "").upper()
+    if not target:
+        die("No Bluetooth adapter address to write")
+    set_master(c, target)
+
+
+def cmd_forget(args):
+    address = args.address.upper()
+    rc, out = run(["bluetoothctl", "remove", address], timeout=10)
+    if rc == 0:
+        emit("ok", f"Removed {address} from BlueZ")
+    else:
+        die(f"Could not remove {address}: {out.strip() or 'not known to BlueZ'}")
+
+
+# --------------------------------------------------------------------------- #
+# Pairing (D-Bus agent + waiting on BlueZ)
+# --------------------------------------------------------------------------- #
+
+def cmd_pair(args):
+    try:
+        import dbus
+        import dbus.mainloop.glib
+        import dbus.service
+        from gi.repository import GLib
+    except ImportError as e:
+        die(f"Missing Python module ({e.name}). Install: python-dbus python-gobject")
+
+    controller = pick_controller(args.device)
+    if controller["error"]:
+        die(controller["error"] + ". Re-plug the controller so udev grants access, or run with sudo.")
+    address = controller["address"]
+    emit("step", f"Found {controller['name']} {address} on {controller['hidraw']}")
+
+    if controller["clone"] and classic_bonded_only():
+        emit("warn", "This looks like a clone controller. If it won't connect over Bluetooth, "
+                     "run `ps3pair fix-clone` (sets ClassicBondedOnly=false).", hint="fix-clone")
+
+    adapter = ensure_powered()
+
+    dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
+    bus = dbus.SystemBus()
+    loop = GLib.MainLoop()
+    state = {"phase": "plug", "trusted": False, "result": None, "rejected": False}
+
+    def device_path():
+        om = dbus.Interface(bus.get_object(BLUEZ, "/"), "org.freedesktop.DBus.ObjectManager")
+        for path, ifaces in om.GetManagedObjects().items():
+            dev = ifaces.get("org.bluez.Device1")
+            if dev and str(dev.get("Address", "")).upper() == address:
+                return path, dev
+        return None, None
+
+    def set_trusted(path):
+        if state["trusted"]:
+            return
+        props = dbus.Interface(bus.get_object(BLUEZ, path), "org.freedesktop.DBus.Properties")
+        props.Set("org.bluez.Device1", "Blocked", dbus.Boolean(False))
+        props.Set("org.bluez.Device1", "Trusted", dbus.Boolean(True))
+        state["trusted"] = True
+        emit("ok", f"BlueZ trusts {address}")
+
+    def addr_of(path):
+        try:
+            props = dbus.Interface(bus.get_object(BLUEZ, path), "org.freedesktop.DBus.Properties")
+            return str(props.Get("org.bluez.Device1", "Address")).upper()
+        except dbus.DBusException:
+            return ""
+
+    class Rejected(dbus.DBusException):
+        _dbus_error_name = "org.bluez.Error.Rejected"
+
+    class Agent(dbus.service.Object):
+        """Auto-accepts the controller being paired; refuses everything else."""
+
+        def _check(self, device):
+            if addr_of(device) != address:
+                raise Rejected("ps3pair only authorizes the controller it is pairing")
+
+        @dbus.service.method("org.bluez.Agent1", in_signature="", out_signature="")
+        def Release(self):
+            pass
+
+        @dbus.service.method("org.bluez.Agent1", in_signature="os", out_signature="")
+        def AuthorizeService(self, device, uuid):
+            self._check(device)
+            emit("ok", "Authorized the controller in BlueZ")
+
+        @dbus.service.method("org.bluez.Agent1", in_signature="o", out_signature="")
+        def RequestAuthorization(self, device):
+            self._check(device)
+
+        @dbus.service.method("org.bluez.Agent1", in_signature="o", out_signature="s")
+        def RequestPinCode(self, device):
+            raise Rejected("no PIN")
+
+        @dbus.service.method("org.bluez.Agent1", in_signature="o", out_signature="u")
+        def RequestPasskey(self, device):
+            raise Rejected("no passkey")
+
+        @dbus.service.method("org.bluez.Agent1", in_signature="ou", out_signature="")
+        def RequestConfirmation(self, device, passkey):
+            self._check(device)
+
+        @dbus.service.method("org.bluez.Agent1", in_signature="", out_signature="")
+        def Cancel(self):
+            pass
+
+    Agent(bus, AGENT_PATH)
+    manager = dbus.Interface(bus.get_object(BLUEZ, "/org/bluez"), "org.bluez.AgentManager1")
+    try:
+        manager.RegisterAgent(AGENT_PATH, "NoInputNoOutput")
+        manager.RequestDefaultAgent(AGENT_PATH)
+    except dbus.DBusException as e:
+        die(f"Could not register a BlueZ agent: {e.get_dbus_message()}")
+
+    # BlueZ logs a rejection when ClassicBondedOnly refuses a clone; watch for it.
+    journal = None
+    if shutil.which("journalctl"):
+        try:
+            journal = subprocess.Popen(
+                ["journalctl", "-f", "-n", "0", "-o", "cat", "-u", "bluetooth"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+            os.set_blocking(journal.stdout.fileno(), False)
+        except OSError:
+            journal = None
+
+    def check_journal():
+        if not journal:
+            return
+        try:
+            chunk = journal.stdout.read() or ""
+        except (OSError, TypeError):
+            return
+        for line in chunk.splitlines():
+            if ("!bonded" in line or "Rejected connection" in line) and not state["rejected"]:
+                state["rejected"] = True
+                emit("warn", "BlueZ rejected the controller because it is not bonded "
+                             "(typical for clones). Run `ps3pair fix-clone`, then pair again.",
+                     hint="fix-clone")
+
+    def finish(result):
+        state["result"] = result
+        loop.quit()
+
+    def prompt_connect():
+        state["phase"] = "connect"
+        emit("action", "Unplug the USB cable, then press the PS button on the controller", phase="connect")
+
+    def advance():
+        check_journal()
+        try:
+            path, dev = device_path()
+        except dbus.DBusException:
+            return True  # bluetoothd restarting; try again
+        if state["phase"] == "plug":
+            if path:
+                set_trusted(path)
+                prompt_connect()
+        elif path and dev and bool(dev.get("Connected", False)):
+            emit("done", f"{controller['name']} is connected over Bluetooth "
+                         "(the player LED should stop blinking)", address=address)
+            finish(0)
+            return False
+        return True
+
+    def on_timeout():
+        if state["phase"] == "plug":
+            emit("error", "BlueZ never registered the controller. Try another USB port or cable, "
+                          "or check: journalctl -u bluetooth | grep sixaxis")
+        else:
+            hint = "fix-clone" if controller["clone"] and classic_bonded_only() else None
+            msg = "The controller did not connect over Bluetooth in time."
+            if hint:
+                msg += " Clone controllers usually need `ps3pair fix-clone`."
+            emit("error", msg, hint=hint)
+        finish(2)
+        return False
+
+    # 1. Point the controller at this machine.
+    emit("step", "Writing this machine's address into the controller")
+    set_master(controller, adapter["address"])
+
+    # 2. Make sure BlueZ knows and trusts it, then 3. wait for it to connect.
+    path, _ = device_path()
+    if path:
+        emit("info", "BlueZ already knows this controller")
+        set_trusted(path)
+        prompt_connect()
+    else:
+        emit("action", "Unplug the USB cable and plug it back in "
+                       "(BlueZ registers the controller when it is plugged in)", phase="plug")
+
+    GLib.timeout_add(500, advance)
+    GLib.timeout_add_seconds(args.timeout, on_timeout)
+    try:
+        loop.run()
+    except KeyboardInterrupt:
+        emit("warn", "Cancelled")
+        state["result"] = 130
+    finally:
+        try:
+            manager.UnregisterAgent(AGENT_PATH)
+        except dbus.DBusException:
+            pass
+        if journal:
+            journal.terminate()
+    sys.exit(state["result"] or 0)
+
+
+# --------------------------------------------------------------------------- #
+
+def main():
+    global EVENTS
+    p = argparse.ArgumentParser(prog="ps3pair", description="Pair a PS3 controller over Bluetooth.")
+    p.add_argument("--events", action="store_true", help="emit progress as JSON lines (for GUIs)")
+    p.add_argument("--version", action="version", version=f"ps3pair {VERSION}")
+    sub = p.add_subparsers(dest="cmd")
+
+    s = sub.add_parser("status", help="show adapter, controller and BlueZ state (default)")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_status)
+
+    s = sub.add_parser("prepare", help="turn Bluetooth on")
+    s.set_defaults(func=cmd_prepare)
+
+    s = sub.add_parser("pair", help="pair the USB-connected controller (guided)")
+    s.add_argument("--device", help="hidraw node or controller address (default: first found)")
+    s.add_argument("--timeout", type=int, default=120, help="seconds to wait (default 120)")
+    s.set_defaults(func=cmd_pair)
+
+    s = sub.add_parser("set-master", help="only write the host address into the controller")
+    s.add_argument("--device")
+    s.add_argument("--address", help="host address (default: this machine's adapter)")
+    s.set_defaults(func=cmd_set_master)
+
+    s = sub.add_parser("fix-clone", help="set ClassicBondedOnly=false so clone controllers can connect")
+    s.add_argument("--pkexec", action="store_true", help="use pkexec instead of sudo")
+    s.set_defaults(func=cmd_fix_clone)
+
+    s = sub.add_parser("forget", help="remove a controller from BlueZ")
+    s.add_argument("address")
+    s.set_defaults(func=cmd_forget)
+
+    args = p.parse_args()
+    if not getattr(args, "func", None):
+        args = p.parse_args(sys.argv[1:] + ["status"])
+    EVENTS = args.events
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

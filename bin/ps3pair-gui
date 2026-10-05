@@ -1,0 +1,15 @@
+#!/bin/bash
+# ps3pair-gui - open the Quickshell front-end for ps3pair.
+
+HERE=$(dirname "$(readlink -f "$0")")
+for qml in "$HERE/../gui/shell.qml" \
+  "${XDG_DATA_HOME:-$HOME/.local/share}/ps3pair/gui/shell.qml" \
+  /usr/share/ps3pair/gui/shell.qml; do
+  [[ -f $qml ]] && break
+done
+[[ -f $qml ]] || { echo "ps3pair-gui: shell.qml not found" >&2; exit 1; }
+
+export PS3PAIR_BIN=${PS3PAIR_BIN:-$HERE/ps3pair}
+[[ -x $PS3PAIR_BIN ]] || PS3PAIR_BIN=ps3pair
+
+exec qs --no-duplicate -p "$qml" "$@"
