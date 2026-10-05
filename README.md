@@ -6,6 +6,7 @@
 
 ![version](https://img.shields.io/github/v/release/FromChaosComesClarity/ps3-gamepad-bluetooth-pairer?label=version&color=2fe0d6&style=flat-square)
 ![platform](https://img.shields.io/badge/platform-Omarchy-0e1113?style=flat-square)
+![license](https://img.shields.io/badge/license-GPL--3.0-2fe0d6?style=flat-square)
 
 </div>
 
@@ -76,6 +77,6 @@ webcam with it. A reboot brings it back, and so does unbinding and rebinding `xh
 
 **one cable · one button · zero pairing mode**
 
-Built by J.R.A.
+Built by J.R.A. · GPL-3.0-or-later
 
 </div>
